@@ -86,7 +86,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-optimization-bq-table",
         default="",
-        help="BigQuery table for final optimized portfolio (FOR_EXTERNAL schema)",
+        help="(Backward-compatible) BigQuery table for optimized portfolio; used as evaluated table if specific outputs are not provided",
+    )
+    parser.add_argument(
+        "--output-optimization-live-bq-table",
+        default="",
+        help="BigQuery table for LIVE optimized portfolio output (FOR_EXTERNAL schema)",
+    )
+    parser.add_argument(
+        "--output-optimization-evaluated-bq-table",
+        default="",
+        help="BigQuery table for EVALUATED optimized portfolio output (FOR_EXTERNAL schema)",
+    )
+    parser.add_argument(
+        "--output-evaluated-bq-table",
+        default="",
+        help="BigQuery table for evaluated signals (actual_outcome/win_loss_flag/evaluation_status)",
     )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--budget", type=float, default=95000.0)
@@ -173,7 +188,11 @@ def add_winloss_from_nextday(
             1, -1
           )
         ELSE NULL
-      END AS win_loss_flag
+      END AS win_loss_flag,
+      CASE
+        WHEN next_day.Low IS NULL OR next_day.High IS NULL THEN 'PENDING_NEXT_DAY_DATA'
+        ELSE 'EVALUATED'
+      END AS evaluation_status
     FROM `{best_action_table}` AS p
     LEFT JOIN (
       SELECT
@@ -245,7 +264,8 @@ def align_for_external_schema(df: pd.DataFrame) -> pd.DataFrame:
     work["price_gap"] = pd.to_numeric(work.get("strike_to_close_price_gap"), errors="coerce")
     work["calls_strike"] = pd.to_numeric(work.get("Call_Option_Strike"), errors="coerce")
     work["days_to_earnings"] = pd.to_numeric(work.get("days_to_earnings"), errors="coerce")
-    work["WinorLoss"] = pd.to_numeric(work.get("win_loss_flag"), errors="coerce").astype("Int64")
+    # Keep as numeric to avoid nullable-int dtype issues across pandas versions.
+    work["WinorLoss"] = pd.to_numeric(work.get("win_loss_flag"), errors="coerce")
     work["prediction_prob"] = pd.to_numeric(work.get("selection_score"), errors="coerce")
     work["expected_return_based_on_prob"] = pd.to_numeric(work.get("expected_return_based_on_prob"), errors="coerce")
     work["Investment"] = pd.to_numeric(work.get("Investment"), errors="coerce")
@@ -272,17 +292,18 @@ def align_for_external_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_optimization_pipeline(
-    client: "bigquery.Client",
-    best_action_table: str,
-    nextday_table: str,
+    source_df: pd.DataFrame,
     threshold: float,
     budget: float,
     max_investment_fraction: float,
     max_portfolios: int,
+    evaluated_only: bool,
 ) -> pd.DataFrame:
     # End-to-end post-selection stage:
     # enrich -> filter by constraints -> optimize per date -> schema align.
-    enriched = add_winloss_from_nextday(client, best_action_table, nextday_table)
+    enriched = source_df.copy()
+    if evaluated_only and "evaluation_status" in enriched.columns:
+        enriched = enriched[enriched["evaluation_status"] == "EVALUATED"].copy()
 
     enriched["selection_score"] = pd.to_numeric(enriched.get("selection_score"), errors="coerce")
     enriched["Investment"] = pd.to_numeric(enriched.get("total_investment"), errors="coerce")
@@ -363,21 +384,55 @@ def main() -> None:
     if args.run_optimization:
         if bigquery is None:
             raise RuntimeError("google-cloud-bigquery not installed; cannot run optimization pipeline")
-        if not args.output_optimization_bq_table:
-            raise ValueError("--output-optimization-bq-table is required when --run-optimization is set")
         if not args.output_bq_table:
             raise ValueError("--output-bq-table is required with --run-optimization so SQL can read persisted best-action rows")
+
+        # Resolve optimization output destinations:
+        # - explicit live/evaluated args take priority
+        # - backward-compatible single table arg maps to evaluated output
+        out_live = args.output_optimization_live_bq_table
+        out_eval = args.output_optimization_evaluated_bq_table or args.output_optimization_bq_table
+        if not out_live and not out_eval:
+            raise ValueError(
+                "Provide at least one optimization output table: "
+                "--output-optimization-live-bq-table and/or --output-optimization-evaluated-bq-table "
+                "(or legacy --output-optimization-bq-table)."
+            )
+
         client = bigquery.Client()
-        optimized = run_optimization_pipeline(
+        evaluated = add_winloss_from_nextday(
             client=client,
             best_action_table=args.output_bq_table,
             nextday_table=args.nextday_bq_table,
-            threshold=args.threshold,
-            budget=args.budget,
-            max_investment_fraction=args.max_investment_fraction,
-            max_portfolios=args.max_portfolios,
         )
-        write_output(optimized, "", args.output_optimization_bq_table, args.write_disposition)
+        if args.output_evaluated_bq_table:
+            write_output(evaluated, "", args.output_evaluated_bq_table, args.write_disposition)
+
+        # LIVE optimization: from current best-action selections (no next-day dependency).
+        if out_live:
+            live_source = selected.copy()
+            live_source["evaluation_status"] = "LIVE"
+            live_optimized = run_optimization_pipeline(
+                source_df=live_source,
+                threshold=args.threshold,
+                budget=args.budget,
+                max_investment_fraction=args.max_investment_fraction,
+                max_portfolios=args.max_portfolios,
+                evaluated_only=False,
+            )
+            write_output(live_optimized, "", out_live, args.write_disposition)
+
+        # EVALUATED optimization: only rows with next-day market data available.
+        if out_eval:
+            evaluated_optimized = run_optimization_pipeline(
+                source_df=evaluated,
+                threshold=args.threshold,
+                budget=args.budget,
+                max_investment_fraction=args.max_investment_fraction,
+                max_portfolios=args.max_portfolios,
+                evaluated_only=True,
+            )
+            write_output(evaluated_optimized, "", out_eval, args.write_disposition)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional BigQuery table in project.dataset.table format. If set, writes predictions to BigQuery instead of CSV output.",
     )
     parser.add_argument(
+        "--bq-write-disposition",
+        default="WRITE_APPEND",
+        choices=["WRITE_APPEND", "WRITE_TRUNCATE", "WRITE_EMPTY"],
+        help="BigQuery write disposition when --output-bq-table is used",
+    )
+    parser.add_argument(
         "--id-columns",
         default="",
         help="Comma-separated identifier columns to keep and place first in output (e.g. Ticker,Stock_Snapshot_Date)",
@@ -298,7 +304,7 @@ def main() -> None:
         load_job = client.load_table_from_dataframe(
             result,
             args.output_bq_table,
-            job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
+            job_config=bigquery.LoadJobConfig(write_disposition=args.bq_write_disposition),
         )
         load_job.result()
         print(f"Batch prediction complete. Rows: {len(result)} | BigQuery table: {args.output_bq_table}")
