@@ -31,17 +31,21 @@ FINAL_OPT_SCHEMA_COLS = [
     "calls_OpenInterest",
     "Volatility_Week",
     "Beta",
+    "Market_Cap",
     "Close_Price",
     "options_price",
     "price_gap",
     "calls_strike",
     "days_to_earnings",
     "WinorLoss",
+    "evaluation_status",
     "prediction_prob",
     "expected_return_based_on_prob",
     "Investment",
     "expected_profit",
     "actual_profit_loss",
+    "eod_nextday_High",
+    "eod_nextday_Low",
     "Threshold",
     "Budget",
     "Max_Investment_Fraction",
@@ -64,8 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--score-column",
         default="prob_Beat",
-        choices=["prob_Beat", "max_prob"],
-        help="Scoring rule: prob_Beat or max_prob (max(prob_Beat, prob_NoBeat))",
+        choices=["prob_Beat"],
+        help="Scoring rule used for ranking candidates (fixed to prob_Beat).",
     )
 
     # Outputs
@@ -92,11 +96,6 @@ def parse_args() -> argparse.Namespace:
         "--output-optimization-live-bq-table",
         default="",
         help="BigQuery table for LIVE optimized portfolio output (FOR_EXTERNAL schema)",
-    )
-    parser.add_argument(
-        "--output-optimization-evaluated-bq-table",
-        default="",
-        help="BigQuery table for EVALUATED optimized portfolio output (FOR_EXTERNAL schema)",
     )
     parser.add_argument(
         "--output-evaluated-bq-table",
@@ -136,6 +135,15 @@ def read_from_bq(table: str) -> pd.DataFrame:
     return client.query(query).to_dataframe()
 
 
+def normalize_market_cap_column(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "Market_Cap" not in out.columns and "Market_cap" in out.columns:
+        out["Market_Cap"] = out["Market_cap"]
+    if "Market_Cap" in out.columns:
+        out["Market_Cap"] = pd.to_numeric(out["Market_Cap"], errors="coerce")
+    return out
+
+
 def select_best_action(df: pd.DataFrame, score_column: str) -> pd.DataFrame:
     working = df.copy()
 
@@ -144,10 +152,8 @@ def select_best_action(df: pd.DataFrame, score_column: str) -> pd.DataFrame:
     working["prob_Beat"] = pd.to_numeric(working["prob_Beat"], errors="coerce")
     working["prob_NoBeat"] = pd.to_numeric(working["prob_NoBeat"], errors="coerce")
 
-    if score_column == "prob_Beat":
-        working["selection_score"] = working["prob_Beat"]
-    else:
-        working["selection_score"] = working[["prob_Beat", "prob_NoBeat"]].max(axis=1)
+    # Selection score is intentionally fixed to prob_Beat.
+    working["selection_score"] = working["prob_Beat"]
 
     # One winner per (Ticker, Stock_Snapshot_Date), highest score first.
     working = working.sort_values(
@@ -172,17 +178,19 @@ def add_winloss_from_nextday(
     query = f"""
     SELECT
       p.*,
+      SAFE_CAST(next_day.High AS FLOAT64) AS joined_eod_nextday_High,
+      SAFE_CAST(next_day.Low AS FLOAT64) AS joined_eod_nextday_Low,
       CASE
-        WHEN p.chosen_action = 'call' THEN IF((p.Stock_Price - next_day.Low) > p.Call_Option_Price, 'Beat', 'NoBeat')
-        WHEN p.chosen_action = 'put' THEN IF((next_day.High - p.Stock_Price) > p.Put_Option_Price, 'Beat', 'NoBeat')
+        WHEN p.chosen_action = 'call' THEN IF(IFNULL((p.Stock_Price - next_day.Low) > p.Call_Option_Price, FALSE), 'Beat', 'NoBeat')
+        WHEN p.chosen_action = 'put' THEN IF(IFNULL((next_day.High - p.Stock_Price) > p.Put_Option_Price, FALSE), 'Beat', 'NoBeat')
         ELSE 'Unknown'
       END AS actual_outcome,
       CASE
-        WHEN p.prediction = 'Beat' THEN
+        WHEN LOWER(TRIM(CAST(p.prediction AS STRING))) IN ('beat', '1', 'true') THEN
           IF(
             CASE
-              WHEN p.chosen_action = 'call' THEN IF((p.Stock_Price - next_day.Low) > p.Call_Option_Price, 'Beat', 'NoBeat')
-              WHEN p.chosen_action = 'put' THEN IF((next_day.High - p.Stock_Price) > p.Put_Option_Price, 'Beat', 'NoBeat')
+              WHEN p.chosen_action = 'call' THEN IF(IFNULL((p.Stock_Price - next_day.Low) > p.Call_Option_Price, FALSE), 'Beat', 'NoBeat')
+              WHEN p.chosen_action = 'put' THEN IF(IFNULL((next_day.High - p.Stock_Price) > p.Put_Option_Price, FALSE), 'Beat', 'NoBeat')
               ELSE 'Unknown'
             END = 'Beat',
             1, -1
@@ -193,7 +201,11 @@ def add_winloss_from_nextday(
         WHEN next_day.Low IS NULL OR next_day.High IS NULL THEN 'PENDING_NEXT_DAY_DATA'
         ELSE 'EVALUATED'
       END AS evaluation_status
-    FROM `{best_action_table}` AS p
+    FROM (
+      SELECT *
+      FROM `{best_action_table}`
+      WHERE LOWER(TRIM(CAST(prediction AS STRING))) IN ('beat', '1', 'true')
+    ) AS p
     LEFT JOIN (
       SELECT
         Ticker,
@@ -250,11 +262,25 @@ def solve_knapsack(df_date: pd.DataFrame, budget: float, max_investment_fraction
 def align_for_external_schema(df: pd.DataFrame) -> pd.DataFrame:
     # Map internal column names to external contract schema and fill absent fields with NULL.
     work = df.copy()
+    def pick(*cols):
+        for c in cols:
+            if c in work.columns:
+                return work[c]
+        return pd.Series(pd.NA, index=work.index)
+
     work["option_type"] = work.get("chosen_action")
     work["lookupvalue"] = work.get("Ticker")
     work["snapshot_date"] = pd.to_datetime(work.get("Stock_Snapshot_Date"), errors="coerce").dt.date
-    work["earnings_date"] = work.get("Earnings_Date") if "Earnings_Date" in work.columns else pd.NA
-    work["calls_exDate"] = work.get("Call_Option_Expiry_Date") if "Call_Option_Expiry_Date" in work.columns else pd.NA
+    work["earnings_date"] = pick("earnings_date", "Earnings_Date")
+    work["calls_exDate"] = pick("calls_exDate", "Call_Option_Expiry_Date", "calls_ExDate")
+    work["Average_Volume"] = pd.to_numeric(pick("Average_Volume", "average_volume"), errors="coerce")
+    work["Volume"] = pd.to_numeric(pick("Volume", "volume"), errors="coerce")
+    work["calls_OpenInterest"] = pd.to_numeric(
+        pick("calls_OpenInterest", "calls_openInterest", "Call_OpenInterest"),
+        errors="coerce",
+    )
+    work["Beta"] = pd.to_numeric(pick("Beta", "beta"), errors="coerce")
+    work["Market_Cap"] = pd.to_numeric(work.get("Market_Cap"), errors="coerce")
     work["Close_Price"] = pd.to_numeric(work.get("Stock_Price"), errors="coerce")
     work["options_price"] = np.where(
         work.get("chosen_action").eq("call"),
@@ -266,6 +292,7 @@ def align_for_external_schema(df: pd.DataFrame) -> pd.DataFrame:
     work["days_to_earnings"] = pd.to_numeric(work.get("days_to_earnings"), errors="coerce")
     # Keep as numeric to avoid nullable-int dtype issues across pandas versions.
     work["WinorLoss"] = pd.to_numeric(work.get("win_loss_flag"), errors="coerce")
+    work["evaluation_status"] = work.get("evaluation_status")
     work["prediction_prob"] = pd.to_numeric(work.get("selection_score"), errors="coerce")
     work["expected_return_based_on_prob"] = pd.to_numeric(work.get("expected_return_based_on_prob"), errors="coerce")
     work["Investment"] = pd.to_numeric(work.get("Investment"), errors="coerce")
@@ -282,6 +309,8 @@ def align_for_external_schema(df: pd.DataFrame) -> pd.DataFrame:
         np.round(pd.to_numeric(work["options_price"], errors="coerce") * 100, 2),
         loss_component,
     )
+    work["eod_nextday_High"] = pd.to_numeric(work.get("joined_eod_nextday_High"), errors="coerce")
+    work["eod_nextday_Low"] = pd.to_numeric(work.get("joined_eod_nextday_Low"), errors="coerce")
 
     # Fill required-but-possibly-missing fields as NULL.
     for col in FINAL_OPT_SCHEMA_COLS:
@@ -374,6 +403,7 @@ def main() -> None:
         all_preds = read_from_csv(args.input_call_csv, args.input_put_csv)
     else:
         all_preds = read_from_bq(args.input_bq_table)
+    all_preds = normalize_market_cap_column(all_preds)
 
     # Stage 2: choose one best action per ticker/date.
     ensure_required_columns(all_preds)
@@ -388,15 +418,14 @@ def main() -> None:
             raise ValueError("--output-bq-table is required with --run-optimization so SQL can read persisted best-action rows")
 
         # Resolve optimization output destinations:
-        # - explicit live/evaluated args take priority
+        # - explicit live output arg for paper/live trading
         # - backward-compatible single table arg maps to evaluated output
         out_live = args.output_optimization_live_bq_table
-        out_eval = args.output_optimization_evaluated_bq_table or args.output_optimization_bq_table
+        out_eval = args.output_optimization_bq_table
         if not out_live and not out_eval:
             raise ValueError(
                 "Provide at least one optimization output table: "
-                "--output-optimization-live-bq-table and/or --output-optimization-evaluated-bq-table "
-                "(or legacy --output-optimization-bq-table)."
+                "--output-optimization-live-bq-table and/or --output-optimization-bq-table."
             )
 
         client = bigquery.Client()
@@ -408,12 +437,11 @@ def main() -> None:
         if args.output_evaluated_bq_table:
             write_output(evaluated, "", args.output_evaluated_bq_table, args.write_disposition)
 
-        # LIVE optimization: from current best-action selections (no next-day dependency).
+        # Optimization output table: use evaluated source so evaluation_status is preserved
+        # (EVALUATED / PENDING_NEXT_DAY_DATA based on next-day availability).
         if out_live:
-            live_source = selected.copy()
-            live_source["evaluation_status"] = "LIVE"
             live_optimized = run_optimization_pipeline(
-                source_df=live_source,
+                source_df=evaluated,
                 threshold=args.threshold,
                 budget=args.budget,
                 max_investment_fraction=args.max_investment_fraction,

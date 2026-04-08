@@ -84,17 +84,34 @@ def read_bq_any(table: str, split_value: str, year_value: int, date_value: str) 
     if bigquery is None:
         raise RuntimeError("google-cloud-bigquery not installed; cannot read BigQuery input")
     client = bigquery.Client()
+
+    table_obj = client.get_table(table)
+    table_cols = {f.name for f in table_obj.schema}
+
     where_clauses = []
     params = []
+
     if split_value:
-        where_clauses.append("split = @split")
-        params.append(bigquery.ScalarQueryParameter("split", "STRING", split_value))
+        if "split" in table_cols:
+            where_clauses.append("split = @split")
+            params.append(bigquery.ScalarQueryParameter("split", "STRING", split_value))
+        else:
+            print(f"Warning: input table {table} has no 'split' column. Ignoring --input-bq-split.")
+
     if date_value:
-        where_clauses.append("DATE(Stock_Snapshot_Date) = @snapshot_date")
-        params.append(bigquery.ScalarQueryParameter("snapshot_date", "DATE", date_value))
+        if "Stock_Snapshot_Date" in table_cols:
+            where_clauses.append("DATE(Stock_Snapshot_Date) = @snapshot_date")
+            params.append(bigquery.ScalarQueryParameter("snapshot_date", "DATE", date_value))
+        else:
+            print(f"Warning: input table {table} has no 'Stock_Snapshot_Date' column. Ignoring --input-bq-date.")
+
     if year_value:
-        where_clauses.append("EXTRACT(YEAR FROM DATE(Stock_Snapshot_Date)) = @year")
-        params.append(bigquery.ScalarQueryParameter("year", "INT64", year_value))
+        if "Stock_Snapshot_Date" in table_cols:
+            where_clauses.append("EXTRACT(YEAR FROM DATE(Stock_Snapshot_Date)) = @year")
+            params.append(bigquery.ScalarQueryParameter("year", "INT64", year_value))
+        else:
+            print(f"Warning: input table {table} has no 'Stock_Snapshot_Date' column. Ignoring --input-bq-year.")
+
     query = f"SELECT * FROM `{table}`"
     if where_clauses:
         query += " WHERE " + " AND ".join(where_clauses)
@@ -136,6 +153,7 @@ def prepare_for_bigquery(df: pd.DataFrame) -> pd.DataFrame:
         "Performance_Week",
         "Average_True_Range",
         "Change",
+        "Market_Cap",
         "Call_Option_Strike",
         "Call_Option_Price",
         "Put_Option_Price",
@@ -170,6 +188,34 @@ def prepare_for_bigquery(df: pd.DataFrame) -> pd.DataFrame:
                 .str.strip()
             )
             out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+    return out
+
+
+def normalize_market_cap_column(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "Market_Cap" not in out.columns and "Market_cap" in out.columns:
+        out["Market_Cap"] = out["Market_cap"]
+    return out
+
+
+def normalize_percent_like_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        if not (pd.api.types.is_object_dtype(out[col]) or pd.api.types.is_string_dtype(out[col])):
+            continue
+        sample = out[col].dropna().astype(str).head(200)
+        if sample.empty:
+            continue
+        if not sample.str.contains("%", regex=False).any():
+            continue
+        out[col] = (
+            out[col]
+            .astype(str)
+            .str.replace("%", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        out[col] = pd.to_numeric(out[col], errors="coerce") / 100.0
     return out
 
 
@@ -242,6 +288,8 @@ def main() -> None:
         df = read_csv_any(args.input)
     else:
         df = read_bq_any(args.input_bq_table, args.input_bq_split, args.input_bq_year, args.input_bq_date)
+    df = normalize_market_cap_column(df)
+    df = normalize_percent_like_columns(df)
     if df.empty:
         if args.output:
             write_csv_any(pd.DataFrame(columns=["prediction"]), args.output)
