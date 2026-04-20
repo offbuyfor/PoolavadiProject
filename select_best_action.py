@@ -22,8 +22,8 @@ FINAL_OPT_SCHEMA_COLS = [
     "option_type",
     "lookupvalue",
     "snapshot_date",
-    "earnings_date",
-    "calls_exDate",
+    "Earnings_Date",
+    "Option_Expiry_Date",
     "Average_True_Range",
     "Average_Volume",
     "Relative_Volume",
@@ -271,8 +271,8 @@ def align_for_external_schema(df: pd.DataFrame) -> pd.DataFrame:
     work["option_type"] = work.get("chosen_action")
     work["lookupvalue"] = work.get("Ticker")
     work["snapshot_date"] = pd.to_datetime(work.get("Stock_Snapshot_Date"), errors="coerce").dt.date
-    work["earnings_date"] = pick("earnings_date", "Earnings_Date")
-    work["calls_exDate"] = pick("calls_exDate", "Call_Option_Expiry_Date", "calls_ExDate")
+    work["Earnings_Date"] = pick("Earnings_Date", "earnings_date")
+    work["Option_Expiry_Date"] = pick("Option_Expiry_Date", "Call_Option_Expiry_Date", "Put_Option_Expiry_Date", "calls_exDate", "calls_ExDate")
     work["Average_Volume"] = pd.to_numeric(pick("Average_Volume", "average_volume"), errors="coerce")
     work["Volume"] = pd.to_numeric(pick("Volume", "volume"), errors="coerce")
     work["calls_OpenInterest"] = pd.to_numeric(
@@ -345,7 +345,15 @@ def run_optimization_pipeline(
     enriched = enriched[enriched["Investment"] > 0].copy()
     enriched = enriched[enriched["options_price"] > 0.5].copy()
 
-    enriched["expected_return_based_on_prob"] = enriched["selection_score"] * enriched["Investment"]
+    # Liquidity filters (thresholds derived from p10 of Beat rows in training data, averaged across call and put)
+    enriched["Volume"] = pd.to_numeric(enriched.get("Volume"), errors="coerce")
+    enriched["Relative_Volume"] = pd.to_numeric(enriched.get("Relative_Volume"), errors="coerce")
+    enriched["Market_Cap"] = pd.to_numeric(enriched.get("Market_Cap"), errors="coerce")
+    enriched = enriched[enriched["Volume"] >= 233199.20].copy()
+    enriched = enriched[enriched["Relative_Volume"] >= 0.94].copy()
+    enriched = enriched[enriched["Market_Cap"] >= 122.11].copy()
+
+    enriched["expected_return_based_on_prob"] = enriched["options_price"]
     enriched["Threshold"] = float(threshold)
     enriched["Budget"] = int(budget)
     enriched["Max_Investment_Fraction"] = float(max_investment_fraction)
@@ -353,9 +361,26 @@ def run_optimization_pipeline(
 
     selected_parts = []
     for date, group in enriched.groupby("Stock_Snapshot_Date", dropna=False):
-        picked = solve_knapsack(group, budget, max_investment_fraction, max_portfolios)
-        if not picked.empty:
-            selected_parts.append(picked)
+        days_col = pd.to_numeric(group.get("days_to_earnings"), errors="coerce")
+
+        # Split into two groups: earnings day = 1 and the rest.
+        earnings_group = group[days_col == 1].copy()
+        rest_group = group[days_col != 1].copy()
+
+        # Each group gets half the budget; if no earnings stocks exist, rest gets the full budget.
+        half = budget * 0.5
+        has_earnings = not earnings_group.empty
+
+        earnings_result = solve_knapsack(earnings_group, half, max_investment_fraction, max_portfolios) if has_earnings else pd.DataFrame()
+        earnings_spent = earnings_result["Investment"].sum() if not earnings_result.empty else 0
+        rest_budget = (half + (half - earnings_spent)) if has_earnings else budget
+        rest_slots = max_portfolios - len(earnings_result)
+        rest_result = solve_knapsack(rest_group, rest_budget, max_investment_fraction, rest_slots) if not rest_group.empty and rest_slots > 0 else pd.DataFrame()
+
+        # Union both results for this date.
+        date_result = pd.concat([earnings_result, rest_result], ignore_index=True)
+        if not date_result.empty:
+            selected_parts.append(date_result)
 
     if selected_parts:
         final = pd.concat(selected_parts, ignore_index=True)

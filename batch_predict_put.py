@@ -46,8 +46,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--id-columns",
-        default="",
-        help="Comma-separated identifier columns to keep and place first in output (e.g. Ticker,Stock_Snapshot_Date)",
+        default="Ticker,Stock_Snapshot_Date,Earnings_Date,Option_Expiry_Date",
+        help="Comma-separated identifier columns to keep and place first in output",
     )
     return parser.parse_args()
 
@@ -290,6 +290,7 @@ def main() -> None:
         df = read_bq_any(args.input_bq_table, args.input_bq_split, args.input_bq_year, args.input_bq_date)
     df = normalize_market_cap_column(df)
     df = normalize_percent_like_columns(df)
+    df.rename(columns={"Put_Option_Expiry_Date": "Option_Expiry_Date"}, inplace=True)
     if df.empty:
         if args.output:
             write_csv_any(pd.DataFrame(columns=["prediction"]), args.output)
