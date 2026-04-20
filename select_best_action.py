@@ -345,13 +345,12 @@ def run_optimization_pipeline(
     enriched = enriched[enriched["Investment"] > 0].copy()
     enriched = enriched[enriched["options_price"] > 0.5].copy()
 
-    # Liquidity filters (thresholds derived from p10 of Beat rows in training data, averaged across call and put)
-    enriched["Volume"] = pd.to_numeric(enriched.get("Volume"), errors="coerce")
+    # Liquidity filters (p05 Beat thresholds — best discrimination ratio while retaining 95% of Beats)
+    # Volume dropped: discrimination ratio < 1 at p10, not a useful filter
     enriched["Relative_Volume"] = pd.to_numeric(enriched.get("Relative_Volume"), errors="coerce")
     enriched["Market_Cap"] = pd.to_numeric(enriched.get("Market_Cap"), errors="coerce")
-    enriched = enriched[enriched["Volume"] >= 233199.20].copy()
-    enriched = enriched[enriched["Relative_Volume"] >= 0.94].copy()
-    enriched = enriched[enriched["Market_Cap"] >= 122.11].copy()
+    enriched = enriched[enriched["Relative_Volume"] >= 0.73].copy()
+    enriched = enriched[enriched["Market_Cap"] >= 80.82].copy()
 
     enriched["expected_return_based_on_prob"] = enriched["options_price"]
     enriched["Threshold"] = float(threshold)

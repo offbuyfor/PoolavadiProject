@@ -48,12 +48,50 @@ def prep_data(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
     return working
 
 
-
 def get_beat_p25(raw: pd.DataFrame, target_col: str) -> dict:
     df = prep_data(raw, target_col)
     train = df[df["split"] == "train"]
     beat = train[train[target_col] == "Beat"]
     return {col: beat[col].quantile(0.10) for col in LIQUIDITY_COLS if col in beat.columns}
+
+
+def analyze_thresholds(raw: pd.DataFrame, target_col: str, percentiles: list = None) -> pd.DataFrame:
+    """
+    For each liquidity column, sweep candidate thresholds and report:
+      - % of Beat rows retained (want HIGH)
+      - % of NoBeat rows excluded (want HIGH)
+      - discrimination ratio = nobeat_excluded / beat_excluded (want > 1, higher is better)
+    Returns a DataFrame of results for all columns and thresholds.
+    """
+    if percentiles is None:
+        percentiles = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+
+    df = prep_data(raw, target_col)
+    train = df[df["split"] == "train"]
+    beat = train[train[target_col] == "Beat"]
+    nobeat = train[train[target_col] != "Beat"]
+
+    rows = []
+    for col in LIQUIDITY_COLS:
+        if col not in train.columns:
+            continue
+        for p in percentiles:
+            threshold = beat[col].quantile(p)
+            beat_retained = (beat[col] >= threshold).mean()
+            nobeat_excluded = (nobeat[col] < threshold).mean()
+            beat_excluded = 1 - beat_retained
+            # How much harder the filter hits NoBeat vs Beat
+            discrimination = nobeat_excluded / beat_excluded if beat_excluded > 0 else float("inf")
+            rows.append({
+                "column": col,
+                "percentile": p,
+                "threshold": round(threshold, 2),
+                "beat_retained_%": round(beat_retained * 100, 1),
+                "nobeat_excluded_%": round(nobeat_excluded * 100, 1),
+                "discrimination_ratio": round(discrimination, 2),
+            })
+
+    return pd.DataFrame(rows)
 
 
 def main() -> None:
@@ -65,13 +103,13 @@ def main() -> None:
 
     if CALL_TARGET in raw.columns:
         call_p25 = get_beat_p25(raw, CALL_TARGET)
-        print(f"\nCall Beat p25: {call_p25}")
+        print(f"\nCall Beat p10: {call_p25}")
     else:
         print(f"WARNING: {CALL_TARGET} not found in table")
 
     if PUT_TARGET in raw.columns:
         put_p25 = get_beat_p25(raw, PUT_TARGET)
-        print(f"Put  Beat p25: {put_p25}")
+        print(f"Put  Beat p10: {put_p25}")
     else:
         print(f"WARNING: {PUT_TARGET} not found in table")
 
@@ -91,6 +129,19 @@ def main() -> None:
         c_str = f"{c:.2f}" if c is not None else "N/A"
         p_str = f"{p:.2f}" if p is not None else "N/A"
         print(f"{col:<25} {c_str:>12} {p_str:>12} {avg:>12.2f}")
+
+    # Beat vs NoBeat discrimination analysis
+    for label, target_col in [("CALL", CALL_TARGET), ("PUT", PUT_TARGET)]:
+        if target_col not in raw.columns:
+            continue
+        print(f"\n{'='*65}")
+        print(f"  {label} — Beat vs NoBeat discrimination by threshold percentile")
+        print(f"{'='*65}")
+        result = analyze_thresholds(raw, target_col)
+        print(result.to_string(index=False))
+        print()
+        print("  Interpretation: pick the percentile where beat_retained_% is high")
+        print("  (>=85%) AND discrimination_ratio is highest.")
 
     print("\nDone.")
 
